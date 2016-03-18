@@ -136,6 +136,16 @@ namespace Microsoft.Azure.Devices.Client
         }
         static string Sign(string requestString, string key)
         {
+#if WINDOWS_UWP
+            if (key == LimpetSupport.SharedKeyPlaceholder)
+            {
+                var data = CryptographicBuffer.ConvertStringToBinary(requestString, BinaryStringEncoding.Utf8).ToArray();
+                var sig_array = LimpetSupport.LimpetSignHmac(0, data);
+                var sign = CryptographicBuffer.EncodeToBase64String(sig_array.AsBuffer());
+                return sign;
+            }
+#endif
+
             var algorithm = WinRTCrypto.MacAlgorithmProvider.OpenAlgorithm(MacAlgorithm.HmacSha256);
             var hash = algorithm.CreateHash(Convert.FromBase64String(key));
             hash.Append(Encoding.UTF8.GetBytes(requestString));

@@ -6,6 +6,9 @@ namespace Microsoft.Azure.Devices.Client
     using System;
     using System.Collections.Generic;
     using System.Text.RegularExpressions;
+    using System.Globalization;
+    using Tpm2Lib;
+
 #if !WINDOWS_UWP
     using System.Linq;
     using System.Threading.Tasks;
@@ -177,7 +180,15 @@ namespace Microsoft.Azure.Devices.Client
         {
             if (connectionString  == null)
             {
-                throw new ArgumentNullException("connectionString");
+                uint logical_device_id = 0;
+
+                var uri = LimpetSupport.LimpetGetUri(logical_device_id);
+                if (string.IsNullOrEmpty(uri))
+                {
+                    throw new ArgumentNullException("connectionString");
+                }
+                var parts = uri.Split(new char[]{ '/'});
+                connectionString = string.Format(CultureInfo.InvariantCulture, "HostName={0};DeviceId={1};SharedAccessKey={2}", parts[0], parts[1], LimpetSupport.SharedKeyPlaceholder);
             }
 
             switch (transportType)
@@ -724,5 +735,142 @@ namespace Microsoft.Azure.Devices.Client
             throw lastException;
         }
 #endif
+    }
+
+    class LimpetSupport
+    {
+        public const string SharedKeyPlaceholder = "6OZfeQocC8BsAZxR/OxLJh7I3MIGGao4rFcOLq/V8Fg=";
+        public static string LimpetGetUri(UInt32 LogicalDeviceId)
+        {
+            const UInt32 AIOTH_PERSISTED_URI_INDEX = 0x01400100;
+            TpmHandle nvUriHandle = new TpmHandle(AIOTH_PERSISTED_URI_INDEX + LogicalDeviceId);
+            Byte[] nvData;
+            string iotHubUri = "";
+
+            try
+            {
+                // Open the TPM
+                Tpm2Device tpmDevice = new TbsDevice();
+                tpmDevice.Connect();
+                var tpm = new Tpm2(tpmDevice);
+
+                // Read the URI from the TPM
+                Byte[] name;
+                NvPublic nvPublic = tpm.NvReadPublic(nvUriHandle, out name);
+                nvData = tpm.NvRead(nvUriHandle, nvUriHandle, nvPublic.dataSize, 0);
+
+                // Dispose of the TPM
+                tpm.Dispose();
+            }
+            catch
+            {
+                return iotHubUri;
+            }
+
+            // Convert the data to a srting for output
+            iotHubUri = System.Text.Encoding.UTF8.GetString(nvData);
+            iotHubUri = System.Text.Encoding.UTF8.GetString(nvData);
+            return iotHubUri;
+        }
+
+        public static string LimpetGetDeviceId(UInt32 LogicalDeviceId)
+        {
+            const UInt32 TPM20_SRK_HANDLE = 0x81000001;
+            TpmHandle srkHandle = new TpmHandle(TPM20_SRK_HANDLE);
+            Byte[] name = { 0 };
+            string DeviceId = "";
+
+            try
+            {
+                // Open the TPM
+                Tpm2Device tpmDevice = new TbsDevice();
+                tpmDevice.Connect();
+                var tpm = new Tpm2(tpmDevice);
+
+                // Get the SRK Name from the TPM
+                Byte[] qualifiedName = { 0 };
+                TpmPublic keyPublic = tpm.ReadPublic(srkHandle, out name, out qualifiedName);
+
+                // Dispose of the TPM
+                tpm.Dispose();
+            }
+            catch
+            {
+                return DeviceId;
+            }
+
+            // Derive the logical device identity and foramt it for output
+            Byte[] logicalDeviceId = CryptoLib.HashData(TpmAlgId.Sha256, BitConverter.GetBytes(LogicalDeviceId), name);
+            foreach (Byte digit in logicalDeviceId)
+            {
+                DeviceId += digit.ToString("x2");
+            }
+            return DeviceId;
+        }
+
+        public static Byte[] LimpetSignHmac(UInt32 LogicalDeviceId, Byte[] dataToSign)
+        {
+            const UInt32 AIOTH_PERSISTED_KEY_HANDLE = 0x81000100;
+            TpmHandle hmacKeyHandle = new TpmHandle(AIOTH_PERSISTED_KEY_HANDLE + LogicalDeviceId);
+            int dataIndex = 0;
+            Byte[] iterationBuffer;
+            Byte[] hmac = { };
+
+            if (dataToSign.Length <= 1024)
+            {
+                try
+                {
+                    // Open the TPM
+                    Tpm2Device tpmDevice = new TbsDevice();
+                    tpmDevice.Connect();
+                    var tpm = new Tpm2(tpmDevice);
+
+                    // Calculate the HMAC in one shot
+                    hmac = tpm.Hmac(hmacKeyHandle, dataToSign, TpmAlgId.Sha256);
+
+                    // Dispose of the TPM
+                    tpm.Dispose();
+                }
+                catch
+                {
+                    return hmac;
+                }
+            }
+            else
+            {
+                try
+                {
+                    // Open the TPM
+                    Tpm2Device tpmDevice = new TbsDevice();
+                    tpmDevice.Connect();
+                    var tpm = new Tpm2(tpmDevice);
+
+                    // Start the HMAC sequence
+                    Byte[] hmacAuth = new byte[0];
+                    TpmHandle hmacHandle = tpm.HmacStart(hmacKeyHandle, hmacAuth, TpmAlgId.Sha256);
+                    while (dataToSign.Length > dataIndex + 1024)
+                    {
+                        // Repeat to update the hmac until we only hace <=1024 bytes left
+                        iterationBuffer = new Byte[1024];
+                        Array.Copy(dataToSign, dataIndex, iterationBuffer, 0, 1024);
+                        tpm.SequenceUpdate(hmacHandle, iterationBuffer);
+                        dataIndex += 1024;
+                    }
+                    // Finalize the hmac with the remainder of the data
+                    iterationBuffer = new Byte[dataToSign.Length - dataIndex];
+                    Array.Copy(dataToSign, dataIndex, iterationBuffer, 0, dataToSign.Length - dataIndex);
+                    TkHashcheck nullChk;
+                    hmac = tpm.SequenceComplete(hmacHandle, iterationBuffer, TpmHandle.RhNull, out nullChk);
+
+                    // Dispose of the TPM
+                    tpm.Dispose();
+                }
+                catch
+                {
+                    return hmac;
+                }
+            }
+            return hmac;
+        }
     }
 }
