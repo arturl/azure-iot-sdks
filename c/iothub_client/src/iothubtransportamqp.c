@@ -53,7 +53,7 @@
 #define MESSAGE_RECEIVER_MAX_LINK_SIZE 65536
 #define MESSAGE_SENDER_LINK_NAME "sender-link"
 #define MESSAGE_SENDER_SOURCE_ADDRESS "ingress"
-#define MESSAGE_SENDER_MAX_LINK_SIZE 65536
+#define MESSAGE_SENDER_MAX_LINK_SIZE UINT64_MAX
 
 typedef XIO_HANDLE(*TLS_IO_TRANSPORT_PROVIDER)(const char* fqdn, int port, const char* certificates);
 
@@ -343,6 +343,7 @@ static AMQP_VALUE on_message_received(const void* context, MESSAGE_HANDLE messag
         {
             result = messaging_delivery_rejected("Rejected by application", "Rejected by application");
         }
+        IoTHubMessage_Destroy(iothub_message);
     }
 
     return result;
@@ -1021,7 +1022,7 @@ static void prepareForConnectionRetry(AMQP_TRANSPORT_INSTANCE* transport_state)
 
 // API functions
 
-static TRANSPORT_HANDLE IoTHubTransportAMQP_Create(const IOTHUBTRANSPORT_CONFIG* config)
+static TRANSPORT_LL_HANDLE IoTHubTransportAMQP_Create(const IOTHUBTRANSPORT_CONFIG* config)
 {
     AMQP_TRANSPORT_INSTANCE* transport_state = NULL;
     bool cleanup_required = false;
@@ -1200,7 +1201,7 @@ static TRANSPORT_HANDLE IoTHubTransportAMQP_Create(const IOTHUBTRANSPORT_CONFIG*
     return transport_state;
 }
 
-static void IoTHubTransportAMQP_Destroy(TRANSPORT_HANDLE handle)
+static void IoTHubTransportAMQP_Destroy(TRANSPORT_LL_HANDLE handle)
 {
     if (handle != NULL)
     {
@@ -1237,7 +1238,7 @@ static void IoTHubTransportAMQP_Destroy(TRANSPORT_HANDLE handle)
     }
 }
 
-static void IoTHubTransportAMQP_DoWork(TRANSPORT_HANDLE handle, IOTHUB_CLIENT_LL_HANDLE iotHubClientHandle)
+static void IoTHubTransportAMQP_DoWork(TRANSPORT_LL_HANDLE handle, IOTHUB_CLIENT_LL_HANDLE iotHubClientHandle)
 {
     // Codes_SRS_IOTHUBTRANSPORTAMQP_09_051: [IoTHubTransportAMQP_DoWork shall fail and return immediately if the transport handle parameter is NULL] 
     if (handle == NULL)
@@ -1396,7 +1397,7 @@ static IOTHUB_CLIENT_RESULT IoTHubTransportAMQP_GetSendStatus(IOTHUB_DEVICE_HAND
     return result;
 }
 
-static IOTHUB_CLIENT_RESULT IoTHubTransportAMQP_SetOption(TRANSPORT_HANDLE handle, const char* option, const void* value)
+static IOTHUB_CLIENT_RESULT IoTHubTransportAMQP_SetOption(TRANSPORT_LL_HANDLE handle, const char* option, const void* value)
 {
     IOTHUB_CLIENT_RESULT result;
 
@@ -1445,22 +1446,39 @@ static IOTHUB_CLIENT_RESULT IoTHubTransportAMQP_SetOption(TRANSPORT_HANDLE handl
             transport_state->message_send_timeout = *((size_t*)value);
             result = IOTHUB_CLIENT_OK;
         }
-        // Codes_SRS_IOTHUBTRANSPORTAMQP_09_047: [If optionName is not an option supported then IotHubTransportAMQP_SetOption shall return IOTHUB_CLIENT_INVALID_ARG.] 
+        // Codes_SRS_IOTHUBTRANSPORTAMQP_09_047: [If the option name does not match one of the options handled by this module, then IoTHubTransportAMQP_SetOption shall get  the handle to the XIO and invoke the xio_setoption passing down the option name and value parameters.] 
         else
-        {
-            result = IOTHUB_CLIENT_INVALID_ARG;
-            LogError("Invalid option (%s) passed to uAMQP transport SetOption()\r\n", option);
+        {			
+			if (transport_state->tls_io == NULL &&
+				(transport_state->tls_io = transport_state->tls_io_transport_provider(STRING_c_str(transport_state->iotHubHostFqdn), transport_state->iotHubPort, transport_state->trusted_certificates)) == NULL)
+			{
+				result = IOTHUB_CLIENT_ERROR;
+				LogError("Failed to obtain a TLS I/O transport layer.\r\n");
+			}
+			else
+			{
+				/* Codes_SRS_IOTHUBTRANSPORTUAMQP_03_001: [If xio_setoption fails, IoTHubTransportAMQP_SetOption shall return IOTHUB_CLIENT_ERROR.] */
+				if (xio_setoption(transport_state->tls_io, option, value) == 0)
+				{
+					result = IOTHUB_CLIENT_OK;
+				}
+				else
+				{
+					result = IOTHUB_CLIENT_ERROR;
+					LogError("Invalid option (%s) passed to uAMQP transport SetOption()\r\n", option);
+				}
+			}			
         }
     }
 
     return result;
 }
 
-static IOTHUB_DEVICE_HANDLE IoTHubTransportAMQ_Register(TRANSPORT_HANDLE handle, const char* deviceId, const char* deviceKey, IOTHUB_CLIENT_LL_HANDLE iotHubClientHandle, PDLIST_ENTRY waitingToSend)
+static IOTHUB_DEVICE_HANDLE IoTHubTransportAMQ_Register(TRANSPORT_LL_HANDLE handle, const char* deviceId, const char* deviceKey, IOTHUB_CLIENT_LL_HANDLE iotHubClientHandle, PDLIST_ENTRY waitingToSend)
 {
     IOTHUB_DEVICE_HANDLE result;
     // Codes_SRS_IOTHUBTRANSPORTUAMQP_17_001: [IoTHubTransportAMQ_Register shall return NULL if deviceId, deviceKey or waitingToSend are NULL.] 
-    // Codes_SRS_IOTHUBTRANSPORTUAMQP_17_005: [IoTHubTransportAMQ_Register shall return NULL if the TRANSPORT_HANDLE is NULL.]
+    // Codes_SRS_IOTHUBTRANSPORTUAMQP_17_005: [IoTHubTransportAMQ_Register shall return NULL if the TRANSPORT_LL_HANDLE is NULL.]
     if ((handle ==NULL) || (deviceId == NULL) || (deviceKey == NULL) || (waitingToSend == NULL))
     {
         result = NULL;
@@ -1498,7 +1516,7 @@ static IOTHUB_DEVICE_HANDLE IoTHubTransportAMQ_Register(TRANSPORT_HANDLE handle,
                 else
                 {
                     transport_state->isRegistered = true;
-                    // Codes_SRS_IOTHUBTRANSPORTUAMQP_17_003: [IoTHubTransportAMQ_Register shall return the TRANSPORT_HANDLE as the IOTHUB_DEVICE_HANDLE.] 
+                    // Codes_SRS_IOTHUBTRANSPORTUAMQP_17_003: [IoTHubTransportAMQ_Register shall return the TRANSPORT_LL_HANDLE as the IOTHUB_DEVICE_HANDLE.] 
                     result = (IOTHUB_DEVICE_HANDLE)handle;
                 }
             }
